@@ -34,6 +34,7 @@ pub struct BeingHovered;
 pub struct OriginalMaterial(pub Handle<StandardMaterial>);
 
 
+// to remove
 #[derive(Component)]
 pub struct CollidingComponent;
 
@@ -51,28 +52,95 @@ pub struct AttackCooldown {
 }
 
 
+// #[derive(Component)]
+// pub struct MoveRight;
 
-// NO ONE IN ANY ON MY RANGE
-// NONE, component does not exist
-// -----------------------------------------------------
+// #[derive(Component)]
+// pub struct MoveLeft;
 
-#[derive(Component, Clone, Copy, PartialEq, Eq)]
-pub enum MotionState {
-    Idle,
-    Walking(Entity),
-    Attacking(Entity),
-    Colliding,
+
+
+
+// #### IMPORTS ###############################################
+use bevy::ecs::system::{EntityCommands, SystemParam};
+
+
+// #### GENERALS ###############################################
+pub trait State<T>: Component {}
+
+pub struct NpcState {}
+
+// System parameter for managing states
+#[derive(SystemParam)]
+pub struct States<'w, 's> {
+    commands: Commands<'w, 's>,
 }
 
-// #[derive(Message)]
-// pub struct DeathEvent(pub Entity);
+impl<'w, 's> States<'w, 's> {
+    pub fn entity(&mut self, entity: Entity) -> EntityStates<'_> {
+        EntityStates {
+            commands: self.commands.entity(entity),
+        }
+    }
+}
+
+// Wrapper for managing state transitions on an entity
+pub struct EntityStates<'a> {
+    commands: EntityCommands<'a>,
+}
+
+impl<'a> EntityStates<'a> {
+    pub fn transition<S, F, T>(&mut self, _from: &F, to: T) where F: State<S>, T: State<S> {
+        self.commands.remove::<F>();
+        self.commands.insert(to);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+// #### CUSTOM STATES ###############################################
 
 #[derive(Component)]
-pub struct MoveRight;
+pub struct Idle(pub f32);
+impl State<NpcState> for Idle {}
 
 #[derive(Component)]
-pub struct MoveLeft;
+pub struct Walking(pub Entity);
+impl State<NpcState> for Walking {
 
+}
+
+#[derive(Component)]
+pub struct Attacking(pub Entity);
+impl State<NpcState> for Attacking {}
+
+#[derive(Component)]
+pub struct Colliding {}
+impl State<NpcState> for Colliding {}
+
+
+
+
+
+
+
+
+// Example system using States
+// fn some_system(
+//     mut states: States, 
+//     query: Query<(Entity, &Idle)>
+// ) {
+//     for (entity, idle) in query.iter() {
+//         states.entity(entity).transition(idle, Idle {});
+//     }
+// }
 
 
 

@@ -26,8 +26,8 @@ pub fn spawn_ball(
     };
     let mut rng = rand::rng();
     let size = rng.random_range(1.0..2.0);
-    let atk_range = rng.random_range(2.0..5.0);
-    let dtk_range = rng.random_range(5.0..15.0);
+    let atk_range = rng.random_range(1.0..2.5);
+    let dtk_range = rng.random_range(2.5..6.0);
     let life = rng.random_range(10.0..15.0);
     let atk = rng.random_range(1.0..2.0);
     let atk_cooldown = rng.random_range(0.8..1.2);
@@ -46,7 +46,7 @@ pub fn spawn_ball(
         crate::components::AttackCooldown {
             timer: Timer::from_seconds(atk_cooldown, TimerMode::Repeating),
         },
-        crate::components::MotionState::Idle,
+        crate::components::Idle(_dir),
     ))
         .observe(mark_hover::<Pointer<Over>>())
         .observe(unmark_hover::<Pointer<Out>>())
@@ -56,6 +56,7 @@ pub fn spawn_ball(
         .observe(update_material_on::<Pointer<Release>>(hover_matl.clone()))
         // .observe(rotate_on_drag)
         .id();
+
 }
 
 // TO REMOVE LATER

@@ -18,19 +18,21 @@ fn main() {
 
         .add_systems(Startup, setup_scene)
         .add_systems(Update, draw_mesh_intersections)
-        .add_systems(Update, crate::walking_state::move_towards_system)
         // .add_systems(Update, crate::walking_state::apply_move_direction)
-        .add_systems(Update, crate::attack_state::attack_system)
         .add_systems(Update, crate::attack_state::kill_system)
-        .add_systems(Update, crate::walking_state::move_right)
-        .add_systems(Update, crate::walking_state::move_left)
+        // .add_systems(Update, crate::walking_state::move_right)
+        // .add_systems(Update, crate::walking_state::move_left)
         // .add_systems(Update, detect_system)
         // .add_systems(Update, detect_collisions)
         // .add_systems(Update, apply_collision_material)
         // .add_systems(Update, crate::walking_state::detection_and_collision_system)
-        .add_systems(Update, crate::idle_state::collision_system)
         .add_systems(Update, crate::draw_guizmos::draw_gizmos_system)
         .add_systems(Update, crate::change_color::resolve_material_state)
+
+        // states related systems
+        .add_systems(Update, crate::idle_state::idle_state_system)
+        .add_systems(Update, crate::walking_state::walking_state_system)
+        .add_systems(Update, crate::attack_state::attack_state_system)
 
         .run();
 }

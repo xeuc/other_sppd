@@ -7,6 +7,7 @@ pub fn resolve_material_state(
         &mut MeshMaterial3d<StandardMaterial>,
         &crate::components::OriginalMaterial,
         Option<&crate::components::BeingHovered>,
+        // to remove
         Option<&crate::components::CollidingComponent>,
         &crate::components::Team,
     )>,

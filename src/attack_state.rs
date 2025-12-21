@@ -1,30 +1,40 @@
 
 use bevy::prelude::*;
 
-pub fn attack_system(
+// note: like walk state, this state is team blinded
+// actually no i need it to know which direction i need to go after defeating an enemy
+pub fn attack_state_system(
+    mut states: crate::components::States, 
     time: Res<Time>,
     mut attackers: Query<(
         Entity,
         &mut crate::components::AttackCooldown,
         &crate::components::Attack,
-        &mut crate::components::MotionState,
+        &crate::components::Attacking,
+        &crate::components::Team,
     )>,
     mut lives: Query<&mut crate::components::Life>,
 ) {
-    for (_ent, mut cooldown, atk, mut state) in attackers.iter_mut() {
-        if let crate::components::MotionState::Attacking(target) = *state {
-            if lives.get_mut(target).is_err() {
-                *state = crate::components::MotionState::Idle;
-                cooldown.timer.reset();
-                continue;
+    for (_ent, mut cooldown, atk, state, team) in attackers.iter_mut() {
+        
+        // no target mean enemy defeated! 
+        if lives.get_mut(state.0).is_err() {
+            match team {
+                crate::components::Team::Blue => states.entity(_ent).transition(state, crate::components::Idle(-1.0)),
+                crate::components::Team::Red => states.entity(_ent).transition(state, crate::components::Idle(1.0)),
             }
-
-            cooldown.timer.tick(time.delta());
             
-            if cooldown.timer.is_finished() {
-                if let Ok(mut life) = lives.get_mut(target) {
-                    life.hp -= atk.degat;
-                }
+            cooldown.timer.reset();
+            continue;
+        }
+
+        cooldown.timer.tick(time.delta());
+        
+        if cooldown.timer.is_finished() {
+            // the target entity is located in the attack state:
+            let target = state.0;
+            if let Ok(mut life) = lives.get_mut(target) {
+                life.hp -= atk.degat;
             }
         }
     }

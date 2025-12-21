@@ -53,8 +53,8 @@ pub fn draw_gizmos_system(
         );
 
         gizmos.circle(isometry, transform.scale.x / 2.0, Color::srgb(0.9, 0.0, 0.1));
-        gizmos.circle(isometry, attack_range.0 / 2.0, Color::srgb(0.7, 0.7, 0.1));
-        gizmos.circle(isometry, detection_range.0 / 2.0, Color::srgb(0.0, 0.8, 0.3));
+        gizmos.circle(isometry, attack_range.0, Color::srgb(0.7, 0.7, 0.1));
+        gizmos.circle(isometry, detection_range.0, Color::srgb(0.0, 0.8, 0.3));
 
         // hp bar
         let hp_percent = (life.hp / life.maxhp).clamp(0.0, 1.0) as f32;
