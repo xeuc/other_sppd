@@ -1,6 +1,8 @@
+use bevy::picking::pointer::PointerInteraction;
 use bevy::prelude::*;
 use bevy::gizmos::gizmos::Gizmos;
 use bevy::math::Isometry3d;
+use bevy::color::palettes::tailwind::*;
 
 pub fn _draw_gizmos_system(
     mut gizmos: Gizmos,
@@ -68,5 +70,18 @@ pub fn draw_gizmos_system(
 
         gizmos.line(mid, right, Color::srgb(0.8, 0.1, 0.1));
         gizmos.line(left, mid, Color::srgb(0.1, 0.9, 0.1));
+    }
+}
+
+
+/// A system that draws hit indicators for every pointer.
+pub fn draw_mesh_intersections(pointers: Query<&PointerInteraction>, mut gizmos: Gizmos) {
+    for (point, normal) in pointers
+        .iter()
+        .filter_map(|interaction| interaction.get_nearest_hit())
+        .filter_map(|(_entity, hit)| hit.position.zip(hit.normal))
+    {
+        gizmos.sphere(point, 0.05, RED_500);
+        gizmos.arrow(point, point + normal.normalize() * 0.5, PINK_100);
     }
 }
