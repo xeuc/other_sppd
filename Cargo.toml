@@ -4,7 +4,32 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.17.2"
+bevy = { version = "0.17.2", default-features = false, features = [
+    "bevy_asset",
+    "bevy_scene",
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_sprite",
+    "bevy_pbr",
+    "bevy_ui",
+    "png",
+    "x11",                # desktop
+    "android-game-activity"  # ✅ CHOISIR UNE SEULE
+]}
+
 bevy_mod_picking = "0.20.1"
 rand = "0.9.2"
 
+[lib]
+name = "other_sppd"
+path = "src/lib.rs"
+crate-type = [
+    "staticlib",
+    "cdylib",    # needed for Android
+    "rlib",      # rlib needed for running locally
+]
+
+[[bin]]
+name = "other_sppd"
+path = "src/main.rs"
