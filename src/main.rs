@@ -130,6 +130,16 @@ struct PlacedUnit {
     shape: ShapeKind,
 }
 
+/// Marks a permanently placed *2D* unit: a shape dropped and left sitting in one of the side
+/// panels (from the palette, repositioned from another 2D spot, or converted back from a 3D
+/// `PlacedUnit`). Parallel to `PlacedUnit`, just for the 2D side of the world. Multiple of
+/// these -- and the fixed `PaletteIcon` spawn buttons -- are allowed to overlap freely.
+#[derive(Component, Clone, Copy)]
+struct Placed2DUnit {
+    team: Team,
+    shape: ShapeKind,
+}
+
 /// Marks the single ephemeral destination-preview entity that exists only while a drag started
 /// from the palette (not yet a real placed unit) is in progress.
 #[derive(Component)]
@@ -355,6 +365,15 @@ impl SharedAssets {
         }
     }
 
+    /// Opaque, team-tinted UI color -- the 2D counterpart to `solid_material`, used for a
+    /// resting (not being dragged) placed 2D unit.
+    fn solid_ui_color(&self, team: Team) -> Color {
+        match team {
+            Team::Blue => Color::from(BLUE_500),
+            Team::Red => Color::from(RED_500),
+        }
+    }
+
     /// Fixed translucent blue used for the *origin* marker, regardless of which team is
     /// dragging -- this is what visually distinguishes "where it started" from "where it's
     /// going" (which is always tinted in the team's own color instead).
@@ -375,9 +394,13 @@ enum DragOrigin {
     /// cancelled or rejected drop just discards the ghost.
     #[default]
     Palette,
-    /// Started from an already-placed unit. A cancelled drop must restore that unit to its
-    /// exact original transform.
+    /// Started from an already-placed 3D unit. A cancelled drop, or a rejected (occupied) 3D
+    /// placement, must restore that unit to its exact original transform.
     PlacedUnit,
+    /// Started from an already-placed 2D unit (sitting in a side panel). A cancelled drop, or
+    /// a rejected (occupied) 3D placement, must restore it to its exact original screen
+    /// position.
+    Placed2D,
 }
 
 /// Bookkeeping for the in-progress drag, if any. `moving` is the single source of truth for
@@ -396,6 +419,9 @@ struct DragSession {
     /// Only meaningful when `origin == PlacedUnit`: the unit's transform before this drag
     /// began, used both to place the origin marker and to restore on cancellation.
     original_transform: Transform,
+    /// Only meaningful when `origin == Placed2D`: the unit's on-screen center before this drag
+    /// began, used both to place the origin marker and to restore on cancellation.
+    original_screen_pos: Vec2,
 }
 
 // --- Scene setup (3D world) ---------------------------------------------------------------
@@ -803,6 +829,39 @@ fn on_unit_drag_start(
     session.origin_marker = Some(spawn_origin_marker(&mut commands, &assets, unit.shape, Vec2::ZERO, Some(transform.translation)));
 }
 
+/// Starts a drag on an already-placed *2D* unit: parallel to `on_unit_drag_start`, but the
+/// "original position" to remember is a screen-space center (from the entity's own
+/// `UiGlobalTransform`) rather than a 3D `Transform`.
+fn on_placed2d_drag_start(
+    trigger: On<Pointer<DragStart>>,
+    units: Query<(&UiGlobalTransform, &Placed2DUnit)>,
+    mut commands: Commands,
+    assets: Res<SharedAssets>,
+    mut session: ResMut<DragSession>,
+) {
+    if trigger.button != PointerButton::Primary {
+        return;
+    }
+    let Ok((transform, &unit)) = units.get(trigger.entity) else {
+        return;
+    };
+    let screen_pos = transform.translation;
+
+    session.team = unit.team;
+    session.shape = unit.shape;
+    session.origin = DragOrigin::Placed2D;
+    session.original_screen_pos = screen_pos;
+    session.moving = Some(trigger.entity);
+
+    // Swap to the translucent team-colored preview visuals; shape/size/border stay the same
+    // (they don't change), only the coloring does, so the entity/observers keep receiving
+    // Drag/DragEnd events for the rest of the gesture exactly like the 3D-unit case.
+    let visual = icon_visual(unit.shape, ICON_SIZE, assets.ghost_ui_color(unit.team));
+    commands.entity(trigger.entity).insert((BackgroundColor(visual.background), visual.border_color));
+
+    session.origin_marker = Some(spawn_origin_marker(&mut commands, &assets, unit.shape, screen_pos, None));
+}
+
 /// While the moving entity (destination preview) is being dragged: a plain 2D preview
 /// following the cursor over either side panel, or a 3D preview sliding along the ground
 /// (clamped to the dragging team's half) once the cursor crosses into the middle zone. Shared
@@ -863,7 +922,9 @@ fn on_active_drag(
             if let Some(point) = point_on_ground(camera, camera_transform, pos) {
                 let x = clamp_to_team_half(point.x, session.team);
                 // Resolve occupancy (immutable borrow) before touching the mutable one below.
-                let occupied = session.origin == DragOrigin::Palette && is_occupied(x, point.z, &queries.p1());
+                // Applies whenever a *2D* shape is entering the world (Palette or Placed2D) --
+                // repositioning an already-placed 3D unit never checks this.
+                let occupied = session.origin != DragOrigin::PlacedUnit && is_occupied(x, point.z, &queries.p1());
                 if let Ok((_, transform_opt, visibility_opt)) = queries.p0().get_mut(moving) {
                     if let Some(mut transform) = transform_opt {
                         transform.translation.x = x;
@@ -902,11 +963,11 @@ fn on_active_drag(
         let raw_point = point_on_ground(camera, camera_transform, pos).unwrap_or(Vec3::ZERO);
         let x = clamp_to_team_half(raw_point.x, session.team);
         let y = resting_height(session.shape);
-        let occupied = session.origin == DragOrigin::Palette && is_occupied(x, raw_point.z, &queries.p1());
+        let occupied = session.origin != DragOrigin::PlacedUnit && is_occupied(x, raw_point.z, &queries.p1());
         let visibility = if occupied { Visibility::Hidden } else { Visibility::Visible };
         commands
             .entity(moving)
-            .remove::<(Node, BackgroundColor)>()
+            .remove::<(Node, BackgroundColor, BorderColor)>()
             .insert((
                 Mesh3d(assets.mesh(session.shape)),
                 MeshMaterial3d(assets.ghost_material_3d(session.team)),
@@ -925,10 +986,38 @@ fn on_active_drag(
 /// - Dropping over either side panel removes the moving entity: for a palette-started drag
 ///   that's just discarding a ghost that was never placed; for a unit-started drag that's the
 ///   3D -> 2D "return to the pool" action.
+/// Resets `entity` to a solid, resting 2D unit at `screen_pos`, in whatever state it was in
+/// before (2D or having briefly crossed into 3D during this same gesture). Used both when a
+/// Placed2D drag gets rejected (dropped on an occupied 3D spot) and when it's cancelled via
+/// right-click -- in both cases the unit already existed, so "cancel" means restore, not
+/// discard.
+fn restore_placed2d(commands: &mut Commands, assets: &SharedAssets, shape: ShapeKind, team: Team, screen_pos: Vec2, entity: Entity) {
+    let visual = icon_visual(shape, ICON_SIZE, assets.solid_ui_color(team));
+    commands.entity(entity).remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>, Transform, Visibility)>().insert((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(screen_pos.x - ICON_SIZE / 2.0),
+            top: Val::Px(screen_pos.y - ICON_SIZE / 2.0),
+            width: visual.width,
+            height: visual.height,
+            border: visual.border,
+            border_radius: visual.border_radius,
+            ..default()
+        },
+        BackgroundColor(visual.background),
+        visual.border_color,
+        GlobalZIndex(10),
+        Pickable::default(),
+    ));
+}
+
 fn on_active_drag_end(
     trigger: On<Pointer<DragEnd>>,
     mut commands: Commands,
-    already_placed: Query<Option<&PlacedUnit>>,
+    // Whether `moving` is already a placed unit of either kind -- (is-3D, is-2D) -- used to
+    // decide whether this is its first-ever placement (attach permanent data/observers) or a
+    // reposition/conversion of something that already existed (don't re-attach).
+    already_placed: Query<(Has<PlacedUnit>, Has<Placed2DUnit>)>,
     placed_units: Query<&Transform, With<PlacedUnit>>,
     windows: Query<&Window>,
     world_camera: Single<(&Camera, &GlobalTransform), With<WorldCamera>>,
@@ -960,18 +1049,25 @@ fn on_active_drag_end(
         let x = clamp_to_team_half(raw_point.x, session.team);
         let y = resting_height(session.shape);
 
-        if session.origin == DragOrigin::Palette && is_occupied(x, raw_point.z, &placed_units) {
-            // Occupied target: treat exactly like a cancelled drop. Nothing existed before
-            // this drag (it started from a fixed palette spawn button), so there's nothing to
-            // restore -- just discard the ghost.
-            commands.entity(moving).despawn();
+        // Applies whenever a *2D* shape is entering the world (Palette or Placed2D) --
+        // repositioning an already-placed 3D unit never checks this.
+        if session.origin != DragOrigin::PlacedUnit && is_occupied(x, raw_point.z, &placed_units) {
+            // Occupied target: treat exactly like a cancelled drop. A palette-started drag had
+            // nothing to restore (discard the ghost); a Placed2D-started drag already existed,
+            // so it's restored to its original 2D spot instead of being deleted.
+            if session.origin == DragOrigin::Placed2D {
+                restore_placed2d(&mut commands, &assets, session.shape, session.team, session.original_screen_pos, moving);
+            } else {
+                commands.entity(moving).despawn();
+            }
             return;
         }
 
-        let is_first_placement = matches!(already_placed.get(moving), Ok(None) | Err(_));
+        let (has_3d, has_2d) = already_placed.get(moving).unwrap_or((false, false));
+        let is_first_placement = !has_3d && !has_2d;
 
         let mut unit = commands.entity(moving);
-        unit.remove::<(Node, BackgroundColor, Ghost)>().insert((
+        unit.remove::<(Node, BackgroundColor, BorderColor, Ghost, Placed2DUnit)>().insert((
             Mesh3d(assets.mesh(session.shape)),
             MeshMaterial3d(assets.solid_material(session.team)),
             Transform::from_xyz(x, y, raw_point.z),
@@ -981,20 +1077,58 @@ fn on_active_drag_end(
 
         if is_first_placement {
             // First time this entity becomes a real unit: attach its permanent data, plus the
-            // observers it'll need for every future drag of its own (DragStart to recognize
-            // it's a unit, and Drag/DragEnd since it'll now be the entity events target
-            // directly, being the originally-pressed entity on those future gestures).
+            // observers it'll need for every future drag of its own. Both DragStart observers
+            // (2D and 3D) are attached unconditionally -- each only acts when its own marker
+            // component is present, so whichever form isn't currently active just makes that
+            // one a harmless no-op instead of needing to track "which observers are already
+            // attached" separately.
             unit.insert((PlacedUnit { team: session.team, shape: session.shape }, Stats::for_shape(session.shape)))
                 .observe(on_unit_drag_start)
+                .observe(on_placed2d_drag_start)
                 .observe(on_active_drag)
                 .observe(on_active_drag_end);
+        } else {
+            unit.insert(PlacedUnit { team: session.team, shape: session.shape });
         }
     } else {
-        // Dropped over a side panel: discard (palette-started drag never placed) or remove
-        // (unit-started drag returned to the pool). Either way, the entity goes away.
-        commands.entity(moving).despawn();
+        // Dropped over a side panel: finalize (or reposition) it as a persistent 2D unit,
+        // sitting exactly where it was dropped -- this is what makes "3D -> 2D, converting it
+        // back" and repositioning within/between the two panels actually leave something
+        // behind, instead of just discarding the drag.
+        let (has_3d, has_2d) = already_placed.get(moving).unwrap_or((false, false));
+        let is_first_placement = !has_3d && !has_2d;
+
+        let visual = icon_visual(session.shape, ICON_SIZE, assets.solid_ui_color(session.team));
+        let mut unit = commands.entity(moving);
+        unit.remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>, Transform, Visibility, Ghost, PlacedUnit)>().insert((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(pos.x - ICON_SIZE / 2.0),
+                top: Val::Px(pos.y - ICON_SIZE / 2.0),
+                width: visual.width,
+                height: visual.height,
+                border: visual.border,
+                border_radius: visual.border_radius,
+                ..default()
+            },
+            BackgroundColor(visual.background),
+            visual.border_color,
+            GlobalZIndex(10),
+            Pickable::default(),
+        ));
+
+        if is_first_placement {
+            unit.insert((Placed2DUnit { team: session.team, shape: session.shape }, Stats::for_shape(session.shape)))
+                .observe(on_unit_drag_start)
+                .observe(on_placed2d_drag_start)
+                .observe(on_active_drag)
+                .observe(on_active_drag_end);
+        } else {
+            unit.insert(Placed2DUnit { team: session.team, shape: session.shape });
+        }
     }
 }
+
 
 /// Right-clicking at any point during an active drag cancels it: the destination preview and
 /// origin marker are removed, and if the drag started from an already-placed unit, that unit
@@ -1026,7 +1160,7 @@ fn cancel_drag_on_right_click(
             // removed during the drag, so only the visual/transform components need resetting.
             commands
                 .entity(moving)
-                .remove::<(Node, BackgroundColor)>()
+                .remove::<(Node, BackgroundColor, BorderColor)>()
                 .insert((
                     Mesh3d(assets.mesh(session.shape)),
                     MeshMaterial3d(assets.solid_material(session.team)),
@@ -1034,6 +1168,10 @@ fn cancel_drag_on_right_click(
                     Visibility::Visible,
                     Pickable::default(),
                 ));
+        }
+        DragOrigin::Placed2D => {
+            // Same idea, but restoring to a solid 2D icon at its original screen position.
+            restore_placed2d(&mut commands, &assets, session.shape, session.team, session.original_screen_pos, moving);
         }
     }
 }
