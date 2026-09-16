@@ -5,28 +5,34 @@
 //! - Middle 60%: a real, 60%-width `Camera3d` view of a ground plane.
 //! - Right 20%: black panel, Team Red's palette.
 //!
-//! Architecture: palette/spawner, plus draggable placed units.
+//! Architecture: palette/spawner, plus draggable placed units (2D and 3D).
 //! The 6 sidebar icons (3 shapes x 2 teams) are permanent UI elements that never move and
 //! never change component set -- they are just "spawn buttons". Dragging one spawns a single
-//! ephemeral `Ghost` entity that does the moving. Once dropped over the 3D world (and the
-//! target spot is free), that ghost is promoted in place into a permanent, opaque `PlacedUnit`.
+//! ephemeral `Ghost` entity that does the moving. Once dropped, that ghost is promoted in
+//! place into a permanent unit: a `PlacedUnit` if dropped in the 3D world, or a `Placed2DUnit`
+//! if dropped back on a panel.
 //!
-//! Placed units are themselves draggable:
-//! - Dragging a placed unit back onto either side panel removes it (3D -> 2D "return to pool").
+//! Placed units (2D or 3D) are themselves draggable:
 //! - Dragging a placed unit around the 3D world repositions it; overlaps with other placed
 //!   units are allowed here (no physics/collision resolution, per spec).
+//! - Dragging a placed unit onto a side panel converts it into a `Placed2DUnit` sitting there
+//!   ("3D -> 2D, converting it back"); dragging *that* back into the world converts it back,
+//!   resolving spawn overlaps exactly like a fresh palette placement (see `resolve_spawn_position`).
 //! - Right-clicking mid-drag cancels: a fresh palette-drag just discards its ghost (nothing
-//!   existed before), while a placed-unit drag is restored to its exact original transform.
+//!   existed before), while a placed-unit drag (2D or 3D) is restored to its exact original
+//!   position.
 //!
 //! Every drag (whichever entity started it) is tracked by a single `DragSession` resource, so
-//! the drag-move and drag-cancel logic is shared between the two origins; only "how the drag
-//! starts" and "what happens if you drop it in the world with no free target" differ (the
-//! latter only matters for a brand-new placement, not for a placed unit).
+//! the drag-move and drag-cancel logic is shared between all three origins (`Palette`,
+//! `PlacedUnit`, `Placed2D`); only "how the drag starts" and a few origin-gated branches (the
+//! spawn-overlap resolution, and what a cancellation restores) differ.
 //!
 //! Ghosts, while a drag is active:
 //! - A destination ghost/preview follows the cursor: a 2D icon over either side panel, a
-//!   translucent 3D mesh over the world (clamped to the dragging team's half). It always uses
-//!   a lighter, translucent version of the *team's* color.
+//!   translucent 3D mesh over the world (clamped to the dragging team's half, and -- for a new
+//!   2D -> 3D placement -- resolved around any spawn overlap so it always shows exactly where
+//!   the unit would actually land). It always uses a lighter, translucent version of the
+//!   *team's* color.
 //! - A static origin marker stays at the drag's starting position for the whole gesture, in a
 //!   fixed translucent blue (regardless of team), so the user can always see where the drag
 //!   began. It's removed on drop or cancellation.
@@ -50,10 +56,19 @@
 //! palette icons, by contrast, keep their `Node` forever and are ordinary children of their
 //! panel -- they never need this trick, since they never change shape.
 //!
-//! Deliberately out of scope for this pass: combat logic, and any physics/collision
-//! resolution. A simple occupancy check (see `is_occupied`) prevents a *new* 2D -> 3D
-//! placement from landing on top of an existing unit, but once units exist in the world,
-//! repositioning them (3D -> 3D) may overlap freely.
+//! Spawn-overlap resolution: a *new* 2D -> 3D placement (from the palette, or a `Placed2DUnit`
+//! being redeployed) must never land on top of an existing 3D unit. `resolve_spawn_position`
+//! searches outward in rings from the desired spot for the nearest free one, strictly within
+//! the dragging team's half, and is shared by both the ghost preview and the actual drop so
+//! they always agree. Repositioning an existing 3D unit (3D -> 3D) never goes through this --
+//! that overlap is allowed, per spec.
+//!
+//! Combat & movement: see the "Combat & movement" section below for the full pipeline. In
+//! short, every `PlacedUnit` marches toward the enemy camp by default (`Advancing`), switches
+//! to chasing (`Seeking`) or fighting (`Attacking`) the closest detected enemy as those
+//! `CombatRanges` change frame to frame, and these three components are mutually exclusive --
+//! changing behavior means swapping which one is attached, per the spec's request for
+//! state-via-components rather than one global `State` enum.
 
 use bevy::{
     camera::Viewport,
@@ -77,6 +92,10 @@ fn main() {
                 cancel_drag_on_right_click,
             ),
         )
+        // Combat/movement pipeline, chained for a deterministic, easy-to-reason-about order:
+        // snapshot everyone's position once, decide/update each unit's behavior off that
+        // snapshot, then move and attack. See the "Combat & movement" section below.
+        .add_systems(Update, (snapshot_units, evaluate_targets, advance_units, seek_targets, tick_attacks).chain())
         .run();
 }
 
@@ -96,10 +115,28 @@ const GHOST_ALPHA: f32 = 0.5;
 /// Shared placement footprint half-size (world units), used for the centerline clamp: a
 /// shape's center can get no closer than this to `x = 0` on the wrong side.
 const PLACEMENT_HALF_SIZE: f32 = 0.8;
-/// Approximate footprint radius (world units) used for the "is this spot already taken by
-/// another placed unit" occupancy check on new 2D -> 3D placements. Deliberately simple --
-/// this is a placement-blocking heuristic, not a physics collider.
-const OCCUPANCY_RADIUS: f32 = 0.8;
+/// Half-extent (world units) of the ground plane on each axis -- matches the `size(30.0, 30.0)`
+/// plane in `setup_scene`. A marching unit that reaches the far edge (`+/- MAP_HALF_SIZE` on X)
+/// has crossed the whole map and despawns.
+const MAP_HALF_SIZE: f32 = 15.0;
+/// World units per second of movement, per point of `Stats.speed`. `Stats.speed` is one of
+/// 10/20/30 (see `Stats::for_shape`), so this yields roughly 1.5 to 4.5 units/sec.
+const UNITS_PER_SPEED_POINT: f32 = 0.15;
+/// The `Stats.speed` value (the "++" mid-tier) treated as the 1.0x baseline for attack timing.
+const REFERENCE_SPEED: f32 = 20.0;
+/// Baseline attack wind-up duration (seconds) at `REFERENCE_SPEED`. Scaled by speed in
+/// `windup_duration` so faster units attack more often.
+const BASE_WINDUP_SECS: f32 = 0.6;
+/// Baseline attack cooldown duration (seconds) at `REFERENCE_SPEED`. Scaled by speed in
+/// `cooldown_duration` so faster units attack more often.
+const BASE_COOLDOWN_SECS: f32 = 0.8;
+/// Step size (world units) between successive rings when searching outward for a free spawn
+/// spot around an occupied target -- see `resolve_spawn_position`.
+const SPAWN_SEARCH_RING_STEP: f32 = 0.5;
+/// How many rings outward `resolve_spawn_position` searches before giving up.
+const SPAWN_SEARCH_MAX_RINGS: i32 = 8;
+/// How many directions per ring `resolve_spawn_position` samples.
+const SPAWN_SEARCH_ANGLE_STEPS: i32 = 8;
 
 // --- Marker / data components -------------------------------------------------------------
 
@@ -169,9 +206,60 @@ impl Stats {
     }
 }
 
+/// Current HP of a live battlefield unit. Attached (at full `Stats.hp`) whenever an entity
+/// enters its 3D `PlacedUnit` form, and removed when it leaves the battlefield (converted back
+/// to a 2D unit) -- a unit that's redeployed later starts fresh, not wherever it left off.
+#[derive(Component)]
+struct Health(f32);
+
+/// A unit's detection/attack radii, entirely independent of its own physical footprint (see
+/// `collision_radius`, which is a different, spawn-collision-only concept and must never be
+/// mixed in here).
+#[derive(Component, Clone, Copy)]
+struct CombatRanges {
+    detection: f32,
+    attack: f32,
+}
+
+/// Default behavior: marching in a straight line toward the enemy camp. Every live battlefield
+/// unit has exactly one of `Advancing`/`Seeking`/`Attacking` at a time -- this is the ECS
+/// "state machine via component" pattern: changing behavior means removing whichever of these
+/// is currently present and inserting a different one, rather than mutating a single global
+/// `State` enum field.
+#[derive(Component)]
+struct Advancing;
+
+/// Moving in a straight line (diagonal allowed) directly toward `target`, which is within
+/// `CombatRanges.detection` but not yet within `CombatRanges.attack`.
+#[derive(Component)]
+struct Seeking {
+    target: Entity,
+}
+
+/// Stopped, attacking `target` (within `CombatRanges.attack`). `phase`/`timer` alternate
+/// between a wind-up (before a hit lands) and a cooldown (after, before the next wind-up can
+/// start) -- see `tick_attacks`.
+#[derive(Component)]
+struct Attacking {
+    target: Entity,
+    phase: AttackPhase,
+    timer: Timer,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AttackPhase {
+    WindUp,
+    Cooldown,
+}
+
 /// Which team a unit belongs to. Fixed for a palette icon's whole lifetime, and copied onto
 /// every unit it spawns.
-#[derive(Component, Clone, Copy, PartialEq, Default)]
+///
+/// Note this is deliberately *not* a `Component`: it only ever lives as a field inside
+/// `PaletteIcon`/`PlacedUnit`/`Placed2DUnit`, which are the single source of truth for a
+/// unit's team. Deriving `Component` here would let a system query `&Team` and compile
+/// perfectly while silently matching zero entities.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 enum Team {
     #[default]
     Blue,
@@ -179,7 +267,8 @@ enum Team {
 }
 
 /// Which of the three unit archetypes a palette icon (and whatever it spawns) represents.
-#[derive(Component, Clone, Copy, PartialEq, Default)]
+/// Not a `Component`, for the same reason as `Team` above.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 enum ShapeKind {
     #[default]
     Circle,
@@ -230,14 +319,85 @@ fn resting_height(shape: ShapeKind) -> f32 {
     }
 }
 
-/// Whether a candidate ground spot at `(x, z)` is already occupied by another placed unit,
-/// using the simple `OCCUPANCY_RADIUS` heuristic described above. Used only to block *new*
-/// 2D -> 3D placements; repositioning an existing unit never calls this.
-fn is_occupied(x: f32, z: f32, units: &Query<&Transform, With<PlacedUnit>>) -> bool {
-    units.iter().any(|unit_transform| {
-        let delta = Vec2::new(unit_transform.translation.x - x, unit_transform.translation.z - z);
-        delta.length() < OCCUPANCY_RADIUS * 2.0
+/// A shape's own physical footprint radius, used *only* to keep spawns from overlapping (see
+/// `is_occupied_at`/`resolve_spawn_position`). Deliberately simple approximations, in the same
+/// spirit as `resting_height` -- and deliberately never reused for `CombatRanges`, which is an
+/// unrelated, gameplay-facing concept.
+fn collision_radius(shape: ShapeKind) -> f32 {
+    match shape {
+        ShapeKind::Circle => SPHERE_RADIUS,
+        ShapeKind::Square => CUBE_SIZE / 2.0,
+        ShapeKind::Triangle => 0.6,
+    }
+}
+
+/// A unit's detection/attack radii by role. Placeholder, narratively-flavored values (the Tank
+/// has to close the distance before it can swing; the Assassin needs to get in close but has
+/// the speed to do it) -- not a balanced design, same spirit as `Stats::for_shape`.
+fn combat_ranges(shape: ShapeKind) -> CombatRanges {
+    match shape {
+        ShapeKind::Circle => CombatRanges { detection: 6.0, attack: 1.2 },
+        ShapeKind::Square => CombatRanges { detection: 5.0, attack: 1.4 },
+        ShapeKind::Triangle => CombatRanges { detection: 4.0, attack: 1.0 },
+    }
+}
+
+/// World units per second of movement for a unit with this `Stats.speed`.
+fn move_speed(speed: u32) -> f32 {
+    speed as f32 * UNITS_PER_SPEED_POINT
+}
+
+/// Attack wind-up duration for a unit with this `Stats.speed` -- shorter for faster units, so
+/// they attack more often. Simple inverse-of-speed scaling around `REFERENCE_SPEED`; tune the
+/// two `BASE_*_SECS` constants (or this formula) freely, nothing else depends on its shape.
+fn windup_duration(speed: u32) -> f32 {
+    BASE_WINDUP_SECS * (REFERENCE_SPEED / speed as f32)
+}
+
+/// Attack cooldown duration for a unit with this `Stats.speed` -- same inverse-speed scaling as
+/// `windup_duration`.
+fn cooldown_duration(speed: u32) -> f32 {
+    BASE_COOLDOWN_SECS * (REFERENCE_SPEED / speed as f32)
+}
+
+/// Whether a candidate ground spot at `(x, z)` -- for a unit with footprint radius
+/// `my_radius` -- overlaps any existing placed unit's own footprint. Shape-aware on both
+/// sides: two big units need more clearance between them than two small ones.
+fn is_occupied_at(x: f32, z: f32, my_radius: f32, units: &Query<(&Transform, &PlacedUnit)>) -> bool {
+    units.iter().any(|(transform, unit)| {
+        let delta = Vec2::new(transform.translation.x - x, transform.translation.z - z);
+        delta.length() < my_radius + collision_radius(unit.shape)
     })
+}
+
+/// Finds where a unit of `shape` for `team` should actually spawn/land, starting from a
+/// desired `(x, z)` and never crossing the centerline. If the desired spot is free, that's the
+/// answer. Otherwise this searches outward in rings for the nearest free spot, still strictly
+/// within `team`'s half. Returns `None` if nothing reasonably close is free -- in which case
+/// the drop should be refused. Shared by the ghost preview and the actual drop (see
+/// `on_active_drag`/`on_active_drag_end`) so they always agree on exactly where a unit will
+/// land.
+fn resolve_spawn_position(desired_x: f32, desired_z: f32, team: Team, shape: ShapeKind, units: &Query<(&Transform, &PlacedUnit)>) -> Option<Vec3> {
+    let my_radius = collision_radius(shape);
+    let y = resting_height(shape);
+
+    let base_x = clamp_to_team_half(desired_x, team);
+    if !is_occupied_at(base_x, desired_z, my_radius, units) {
+        return Some(Vec3::new(base_x, y, desired_z));
+    }
+
+    for ring in 1..=SPAWN_SEARCH_MAX_RINGS {
+        let radius = ring as f32 * SPAWN_SEARCH_RING_STEP;
+        for step in 0..SPAWN_SEARCH_ANGLE_STEPS {
+            let angle = (step as f32 / SPAWN_SEARCH_ANGLE_STEPS as f32) * std::f32::consts::TAU;
+            let candidate_x = clamp_to_team_half(desired_x + radius * angle.cos(), team);
+            let candidate_z = desired_z + radius * angle.sin();
+            if !is_occupied_at(candidate_x, candidate_z, my_radius, units) {
+                return Some(Vec3::new(candidate_x, y, candidate_z));
+            }
+        }
+    }
+    None
 }
 
 fn role_name(shape: ShapeKind) -> &'static str {
@@ -424,6 +584,171 @@ struct DragSession {
     original_screen_pos: Vec2,
 }
 
+// --- Combat & movement -----------------------------------------------------------------
+//
+// Every live battlefield unit (a `PlacedUnit` with `Health`/`CombatRanges`/one of
+// `Advancing`/`Seeking`/`Attacking`) goes through this chained pipeline every frame:
+//
+// 1. `snapshot_units` reads everyone's (entity, position, team) into a plain `UnitSnapshot`
+//    resource. Every other system below reads positions from *this*, not from a live query --
+//    that's what lets `evaluate_targets` (which needs to see every unit) and `seek_targets`
+//    (which needs to move its own unit while reading its target's position) coexist without
+//    fighting over mutable/immutable access to `Transform`, no `ParamSet` needed.
+// 2. `evaluate_targets` re-derives, from scratch, what each unit's behavior *should* be this
+//    frame (Attacking > Seeking > Advancing, in that priority) and swaps components only when
+//    it actually needs to change. Because this always recomputes fresh off the snapshot, target
+//    death, a target leaving range, or a closer enemy showing up are all just naturally handled
+//    every frame -- there's no separate "did my target die" bookkeeping to get out of sync.
+// 3. `advance_units`/`seek_targets` move whichever units are in that respective state.
+// 4. `tick_attacks` ticks wind-up/cooldown timers and applies damage.
+
+/// A plain per-frame cache of every battlefield unit's (entity, position, team), rebuilt by
+/// `snapshot_units`. Everything downstream reads positions from here instead of a live query,
+/// which is what keeps the mutable-Transform systems below simple (no `ParamSet` needed for
+/// them) while still letting them see every other unit's position.
+#[derive(Resource, Default)]
+struct UnitSnapshot {
+    units: Vec<(Entity, Vec3, Team)>,
+}
+
+fn snapshot_units(mut snapshot: ResMut<UnitSnapshot>, units: Query<(Entity, &Transform, &PlacedUnit)>, session: Res<DragSession>) {
+    snapshot.units.clear();
+    snapshot.units.extend(
+        units
+            .iter()
+            // A unit being dragged keeps its `PlacedUnit`/`Transform` for the whole gesture, so
+            // without this it would stay targetable while the player holds it -- and could be
+            // killed mid-drag, leaving `DragSession.moving` pointing at a despawned entity.
+            // Its own behavior is already paused (see `on_unit_drag_start`); this is the other
+            // half of that, making it invisible to everyone else's targeting too.
+            .filter(|(entity, _, _)| session.moving != Some(*entity))
+            .map(|(entity, transform, unit)| (entity, transform.translation, unit.team)),
+    );
+}
+
+/// Re-derives each unit's behavior from scratch every frame: the closest enemy within
+/// `CombatRanges.attack` (if any) beats the closest within `CombatRanges.detection` (if any)
+/// beats plain `Advancing`. Only actually swaps components when the outcome differs from the
+/// unit's current state, so a unit that's still correctly attacking/seeking the same target
+/// keeps its `Attacking` timer/phase untouched.
+fn evaluate_targets(
+    mut commands: Commands,
+    snapshot: Res<UnitSnapshot>,
+    self_units: Query<(Entity, &Transform, &PlacedUnit, &Stats, &CombatRanges, Has<Advancing>, Option<&Seeking>, Option<&Attacking>)>,
+) {
+    for (entity, transform, unit, stats, ranges, is_advancing, seeking, attacking) in &self_units {
+        let mut closest_attack: Option<(Entity, f32)> = None;
+        let mut closest_detect: Option<(Entity, f32)> = None;
+        for &(other, other_pos, other_team) in &snapshot.units {
+            if other == entity || other_team == unit.team {
+                continue;
+            }
+            let distance = transform.translation.distance(other_pos);
+            if distance <= ranges.attack && closest_attack.map_or(true, |(_, d)| distance < d) {
+                closest_attack = Some((other, distance));
+            }
+            if distance <= ranges.detection && closest_detect.map_or(true, |(_, d)| distance < d) {
+                closest_detect = Some((other, distance));
+            }
+        }
+
+        if let Some((target, _)) = closest_attack {
+            if !attacking.is_some_and(|a| a.target == target) {
+                commands.entity(entity).remove::<(Advancing, Seeking, Attacking)>().insert(Attacking {
+                    target,
+                    phase: AttackPhase::WindUp,
+                    timer: Timer::from_seconds(windup_duration(stats.speed), TimerMode::Once),
+                });
+            }
+        } else if let Some((target, _)) = closest_detect {
+            if !seeking.is_some_and(|s| s.target == target) {
+                commands.entity(entity).remove::<(Advancing, Seeking, Attacking)>().insert(Seeking { target });
+            }
+        } else if !is_advancing {
+            commands.entity(entity).remove::<(Advancing, Seeking, Attacking)>().insert(Advancing);
+        }
+    }
+}
+
+/// Default behavior: march in a straight line along the team's forward axis (X only -- no Z
+/// drift) at a speed derived from `Stats.speed`, framerate-independent via `delta_secs`.
+/// Despawns (after logging) a unit that reaches the far edge of the map.
+fn advance_units(mut commands: Commands, mut units: Query<(Entity, &mut Transform, &PlacedUnit, &Stats), With<Advancing>>, time: Res<Time>) {
+    let dt = time.delta_secs();
+    for (entity, mut transform, unit, stats) in &mut units {
+        let team = unit.team;
+        let forward_x = match team {
+            Team::Blue => 1.0,
+            Team::Red => -1.0,
+        };
+        transform.translation.x += forward_x * move_speed(stats.speed) * dt;
+
+        let reached_far_edge = match team {
+            Team::Blue => transform.translation.x >= MAP_HALF_SIZE,
+            Team::Red => transform.translation.x <= -MAP_HALF_SIZE,
+        };
+        if reached_far_edge {
+            info!("{team:?} unit {entity:?} reached the far edge of the map and was removed.");
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+/// `Seeking` behavior: move in a straight line (diagonal allowed) directly toward the target's
+/// *current* position (read from `UnitSnapshot`, not a live query -- see the section doc
+/// comment above), without overshooting past it.
+fn seek_targets(mut units: Query<(&mut Transform, &Stats, &Seeking)>, snapshot: Res<UnitSnapshot>, time: Res<Time>) {
+    let dt = time.delta_secs();
+    for (mut transform, stats, seeking) in &mut units {
+        let Some(&(_, target_pos, _)) = snapshot.units.iter().find(|(e, _, _)| *e == seeking.target) else {
+            // Target despawned this exact frame; evaluate_targets will pick a new behavior on
+            // the next one.
+            continue;
+        };
+        let to_target = Vec3::new(target_pos.x - transform.translation.x, 0.0, target_pos.z - transform.translation.z);
+        let distance = to_target.length();
+        let step = move_speed(stats.speed) * dt;
+        if distance <= step || distance < 1e-4 {
+            transform.translation.x = target_pos.x;
+            transform.translation.z = target_pos.z;
+        } else {
+            let dir = to_target / distance;
+            transform.translation.x += dir.x * step;
+            transform.translation.z += dir.z * step;
+        }
+    }
+}
+
+/// `Attacking` behavior: while stopped, alternates the wind-up/cooldown timer. Damage lands at
+/// the end of the wind-up (if the target's still alive), then cooldown blocks the next wind-up
+/// from starting immediately. A dead target is despawned right here, so the next frame's
+/// `snapshot_units` (and therefore `evaluate_targets`) already sees a world without it.
+fn tick_attacks(mut commands: Commands, mut attackers: Query<(&Stats, &mut Attacking)>, mut healths: Query<&mut Health>, time: Res<Time>) {
+    let dt = time.delta();
+    for (stats, mut attacking) in &mut attackers {
+        attacking.timer.tick(dt);
+        if !attacking.timer.is_finished() {
+            continue;
+        }
+        match attacking.phase {
+            AttackPhase::WindUp => {
+                if let Ok(mut health) = healths.get_mut(attacking.target) {
+                    health.0 -= stats.attack as f32;
+                    if health.0 <= 0.0 {
+                        commands.entity(attacking.target).despawn();
+                    }
+                }
+                attacking.phase = AttackPhase::Cooldown;
+                attacking.timer = Timer::from_seconds(cooldown_duration(stats.speed), TimerMode::Once);
+            }
+            AttackPhase::Cooldown => {
+                attacking.phase = AttackPhase::WindUp;
+                attacking.timer = Timer::from_seconds(windup_duration(stats.speed), TimerMode::Once);
+            }
+        }
+    }
+}
+
 // --- Scene setup (3D world) ---------------------------------------------------------------
 
 fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
@@ -481,6 +806,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut mat
         red_ghost_3d,
     });
     commands.insert_resource(DragSession::default());
+    commands.insert_resource(UnitSnapshot::default());
 }
 
 /// Keeps the world camera's viewport locked to exactly the middle 60% of the window, in
@@ -824,7 +1150,13 @@ fn on_unit_drag_start(
 
     // Swap to the translucent team-colored preview material; the mesh/entity/observers stay
     // exactly the same, so it keeps receiving Drag/DragEnd events for the rest of the gesture.
-    commands.entity(trigger.entity).insert(MeshMaterial3d(assets.ghost_material_3d(unit.team)));
+    // Also pause combat/movement for the duration of the drag: whichever behavior state it was
+    // in gets removed, so the combat systems (all scoped to Advancing/Seeking/Attacking) simply
+    // stop touching this entity until it's re-placed.
+    commands
+        .entity(trigger.entity)
+        .insert(MeshMaterial3d(assets.ghost_material_3d(unit.team)))
+        .remove::<(Advancing, Seeking, Attacking)>();
 
     session.origin_marker = Some(spawn_origin_marker(&mut commands, &assets, unit.shape, Vec2::ZERO, Some(transform.translation)));
 }
@@ -871,12 +1203,13 @@ fn on_active_drag(
     drag: On<Pointer<Drag>>,
     mut commands: Commands,
     // Split into a `ParamSet`: `p0` needs `&mut Transform` on the moving entity, `p1` needs a
-    // read-only `&Transform` over every placed unit for the occupancy check. Both touch
-    // `Transform`, so they can't be two plain `Query` params in the same system -- but since we
-    // only ever use one at a time (never both borrowed simultaneously), a `ParamSet` is safe.
+    // read-only `(&Transform, &PlacedUnit)` over every placed unit for spawn-position
+    // resolution. Both touch `Transform`, so they can't be two plain `Query` params in the same
+    // system -- but since we only ever use one at a time (never both borrowed simultaneously),
+    // a `ParamSet` is safe.
     mut queries: ParamSet<(
         Query<(Option<&mut Node>, Option<&mut Transform>, Option<&mut Visibility>)>,
-        Query<&Transform, With<PlacedUnit>>,
+        Query<(&Transform, &PlacedUnit)>,
     )>,
     windows: Query<&Window>,
     world_camera: Single<(&Camera, &GlobalTransform), With<WorldCamera>>,
@@ -920,18 +1253,19 @@ fn on_active_drag(
         } else {
             let (camera, camera_transform) = *world_camera;
             if let Some(point) = point_on_ground(camera, camera_transform, pos) {
-                let x = clamp_to_team_half(point.x, session.team);
-                // Resolve occupancy (immutable borrow) before touching the mutable one below.
-                // Applies whenever a *2D* shape is entering the world (Palette or Placed2D) --
-                // repositioning an already-placed 3D unit never checks this.
-                let occupied = session.origin != DragOrigin::PlacedUnit && is_occupied(x, point.z, &queries.p1());
+                // Resolve the actual spawn-worthy position (immutable borrow) before touching
+                // the mutable one below -- repositioning an existing 3D unit never needs to
+                // resolve around occupancy (3D -> 3D overlap is allowed), so it just uses the
+                // raw clamped point; everything else goes through the shared resolver so the
+                // ghost always shows exactly where a drop would actually land.
+                let resolved = resolve_drag_position(point.x, point.z, &session, &queries.p1());
                 if let Ok((_, transform_opt, visibility_opt)) = queries.p0().get_mut(moving) {
-                    if let Some(mut transform) = transform_opt {
-                        transform.translation.x = x;
-                        transform.translation.z = point.z;
+                    if let (Some(mut transform), Some(new_pos)) = (transform_opt, resolved) {
+                        transform.translation.x = new_pos.x;
+                        transform.translation.z = new_pos.z;
                     }
                     if let Some(mut visibility) = visibility_opt {
-                        *visibility = if occupied { Visibility::Hidden } else { Visibility::Visible };
+                        *visibility = if resolved.is_some() { Visibility::Visible } else { Visibility::Hidden };
                     }
                 }
             }
@@ -958,34 +1292,36 @@ fn on_active_drag(
                 GlobalZIndex(20),
             ));
     } else {
-        // Crossing into the middle zone: show the 3D preview, clamped to this team's half.
+        // Crossing into the middle zone: show the 3D preview at wherever it would actually
+        // spawn (see `resolve_drag_position`).
         let (camera, camera_transform) = *world_camera;
         let raw_point = point_on_ground(camera, camera_transform, pos).unwrap_or(Vec3::ZERO);
-        let x = clamp_to_team_half(raw_point.x, session.team);
-        let y = resting_height(session.shape);
-        let occupied = session.origin != DragOrigin::PlacedUnit && is_occupied(x, raw_point.z, &queries.p1());
-        let visibility = if occupied { Visibility::Hidden } else { Visibility::Visible };
+        let resolved = resolve_drag_position(raw_point.x, raw_point.z, &session, &queries.p1());
+        let fallback_x = clamp_to_team_half(raw_point.x, session.team);
+        let (transform, visibility) = match resolved {
+            Some(new_pos) => (Transform::from_translation(new_pos), Visibility::Visible),
+            None => (Transform::from_xyz(fallback_x, resting_height(session.shape), raw_point.z), Visibility::Hidden),
+        };
         commands
             .entity(moving)
             .remove::<(Node, BackgroundColor, BorderColor)>()
-            .insert((
-                Mesh3d(assets.mesh(session.shape)),
-                MeshMaterial3d(assets.ghost_material_3d(session.team)),
-                Transform::from_xyz(x, y, raw_point.z),
-                visibility,
-            ));
+            .insert((Mesh3d(assets.mesh(session.shape)), MeshMaterial3d(assets.ghost_material_3d(session.team)), transform, visibility));
     }
 }
 
-/// Finalizes a drag (shared by both palette-started and unit-started drags).
-///
-/// - Dropping over the middle zone places/repositions the unit there, recomputed fresh from
-///   the final pointer position. For a brand-new placement (palette origin) this is rejected
-///   (treated as a cancelled drop) if the spot is occupied; repositioning an existing unit
-///   never checks occupancy.
-/// - Dropping over either side panel removes the moving entity: for a palette-started drag
-///   that's just discarding a ghost that was never placed; for a unit-started drag that's the
-///   3D -> 2D "return to the pool" action.
+/// The position a `DragSession`'s ghost preview should show right now, and the same position
+/// the actual drop will use (see `on_active_drag_end`) -- always `Some` for `DragOrigin::
+/// PlacedUnit` (a straight clamp; 3D -> 3D overlap is allowed and never resolved around), and
+/// whatever `resolve_spawn_position` finds (possibly `None`) for a Palette/Placed2D-origin drag
+/// entering the world for the first time.
+fn resolve_drag_position(raw_x: f32, raw_z: f32, session: &DragSession, units: &Query<(&Transform, &PlacedUnit)>) -> Option<Vec3> {
+    if session.origin == DragOrigin::PlacedUnit {
+        Some(Vec3::new(clamp_to_team_half(raw_x, session.team), resting_height(session.shape), raw_z))
+    } else {
+        resolve_spawn_position(raw_x, raw_z, session.team, session.shape, units)
+    }
+}
+
 /// Resets `entity` to a solid, resting 2D unit at `screen_pos`, in whatever state it was in
 /// before (2D or having briefly crossed into 3D during this same gesture). Used both when a
 /// Placed2D drag gets rejected (dropped on an occupied 3D spot) and when it's cancelled via
@@ -1011,6 +1347,17 @@ fn restore_placed2d(commands: &mut Commands, assets: &SharedAssets, shape: Shape
     ));
 }
 
+/// Finalizes a drag (shared by all three origins: `Palette`, `PlacedUnit`, `Placed2D`).
+///
+/// - Dropping over the middle zone places/repositions the unit there, using the same
+///   `resolve_drag_position` the ghost preview just showed. For a Palette/Placed2D origin
+///   entering the world, a `None` result (no free spot found) is treated as a cancelled drop --
+///   discarded for Palette, restored to its original 2D spot for Placed2D. Repositioning an
+///   existing 3D unit always resolves (3D -> 3D overlap is allowed).
+/// - Dropping over either side panel finalizes (or repositions) the unit as a persistent 2D
+///   unit sitting exactly where it was dropped, stripping any combat/movement state -- this is
+///   what "3D -> 2D, converting it back" actually leaves behind, and what makes 2D -> 2D
+///   dragging (same panel, or across to the other one) work.
 fn on_active_drag_end(
     trigger: On<Pointer<DragEnd>>,
     mut commands: Commands,
@@ -1018,7 +1365,7 @@ fn on_active_drag_end(
     // decide whether this is its first-ever placement (attach permanent data/observers) or a
     // reposition/conversion of something that already existed (don't re-attach).
     already_placed: Query<(Has<PlacedUnit>, Has<Placed2DUnit>)>,
-    placed_units: Query<&Transform, With<PlacedUnit>>,
+    placed_units: Query<(&Transform, &PlacedUnit)>,
     windows: Query<&Window>,
     world_camera: Single<(&Camera, &GlobalTransform), With<WorldCamera>>,
     assets: Res<SharedAssets>,
@@ -1046,34 +1393,43 @@ fn on_active_drag_end(
     if zone_of(pos.x, width) == Zone::World {
         let (camera, camera_transform) = *world_camera;
         let raw_point = point_on_ground(camera, camera_transform, pos).unwrap_or(Vec3::ZERO);
-        let x = clamp_to_team_half(raw_point.x, session.team);
-        let y = resting_height(session.shape);
 
-        // Applies whenever a *2D* shape is entering the world (Palette or Placed2D) --
-        // repositioning an already-placed 3D unit never checks this.
-        if session.origin != DragOrigin::PlacedUnit && is_occupied(x, raw_point.z, &placed_units) {
-            // Occupied target: treat exactly like a cancelled drop. A palette-started drag had
-            // nothing to restore (discard the ghost); a Placed2D-started drag already existed,
-            // so it's restored to its original 2D spot instead of being deleted.
+        // Same resolution the ghost preview just showed -- see `resolve_drag_position`. `None`
+        // means no free spot was found reasonably close (only possible for a Palette/Placed2D
+        // origin; PlacedUnit repositioning always resolves), so the drop is refused exactly
+        // like a cancelled one: nothing to restore for a palette-started drag, restore a
+        // Placed2D-started one to its original 2D spot.
+        let Some(spawn_pos) = resolve_drag_position(raw_point.x, raw_point.z, &session, &placed_units) else {
             if session.origin == DragOrigin::Placed2D {
                 restore_placed2d(&mut commands, &assets, session.shape, session.team, session.original_screen_pos, moving);
             } else {
                 commands.entity(moving).despawn();
             }
             return;
-        }
+        };
 
         let (has_3d, has_2d) = already_placed.get(moving).unwrap_or((false, false));
         let is_first_placement = !has_3d && !has_2d;
 
         let mut unit = commands.entity(moving);
-        unit.remove::<(Node, BackgroundColor, BorderColor, Ghost, Placed2DUnit)>().insert((
+        unit.remove::<(Node, BackgroundColor, BorderColor, Ghost, Placed2DUnit, Seeking, Attacking)>().insert((
             Mesh3d(assets.mesh(session.shape)),
             MeshMaterial3d(assets.solid_material(session.team)),
-            Transform::from_xyz(x, y, raw_point.z),
+            Transform::from_translation(spawn_pos),
             Visibility::Visible,
             Pickable::default(),
         ));
+
+        if session.origin == DragOrigin::PlacedUnit {
+            // Pure repositioning: this unit already existed on the battlefield, so its current
+            // `Health`/`CombatRanges` carry over untouched -- only its behavior resets, since
+            // whatever it was doing before being picked up no longer applies from its new spot.
+            unit.insert(Advancing);
+        } else {
+            // Entering (or re-entering, from a 2D placement) the battlefield: always full
+            // strength, starting out marching.
+            unit.insert((Health(Stats::for_shape(session.shape).hp as f32), combat_ranges(session.shape), Advancing));
+        }
 
         if is_first_placement {
             // First time this entity becomes a real unit: attach its permanent data, plus the
@@ -1094,28 +1450,32 @@ fn on_active_drag_end(
         // Dropped over a side panel: finalize (or reposition) it as a persistent 2D unit,
         // sitting exactly where it was dropped -- this is what makes "3D -> 2D, converting it
         // back" and repositioning within/between the two panels actually leave something
-        // behind, instead of just discarding the drag.
+        // behind, instead of just discarding the drag. Leaving the battlefield strips all
+        // combat/movement state; a unit redeployed later starts fresh (see the World-zone
+        // branch above).
         let (has_3d, has_2d) = already_placed.get(moving).unwrap_or((false, false));
         let is_first_placement = !has_3d && !has_2d;
 
         let visual = icon_visual(session.shape, ICON_SIZE, assets.solid_ui_color(session.team));
         let mut unit = commands.entity(moving);
-        unit.remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>, Transform, Visibility, Ghost, PlacedUnit)>().insert((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(pos.x - ICON_SIZE / 2.0),
-                top: Val::Px(pos.y - ICON_SIZE / 2.0),
-                width: visual.width,
-                height: visual.height,
-                border: visual.border,
-                border_radius: visual.border_radius,
-                ..default()
-            },
-            BackgroundColor(visual.background),
-            visual.border_color,
-            GlobalZIndex(10),
-            Pickable::default(),
-        ));
+        unit.remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>, Transform, Visibility, Ghost, PlacedUnit)>()
+            .remove::<(Health, CombatRanges, Advancing, Seeking, Attacking)>()
+            .insert((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(pos.x - ICON_SIZE / 2.0),
+                    top: Val::Px(pos.y - ICON_SIZE / 2.0),
+                    width: visual.width,
+                    height: visual.height,
+                    border: visual.border,
+                    border_radius: visual.border_radius,
+                    ..default()
+                },
+                BackgroundColor(visual.background),
+                visual.border_color,
+                GlobalZIndex(10),
+                Pickable::default(),
+            ));
 
         if is_first_placement {
             unit.insert((Placed2DUnit { team: session.team, shape: session.shape }, Stats::for_shape(session.shape)))
@@ -1128,7 +1488,6 @@ fn on_active_drag_end(
         }
     }
 }
-
 
 /// Right-clicking at any point during an active drag cancels it: the destination preview and
 /// origin marker are removed, and if the drag started from an already-placed unit, that unit
@@ -1156,8 +1515,10 @@ fn cancel_drag_on_right_click(
         }
         DragOrigin::PlacedUnit => {
             // Restore the exact original environment and position: back to a solid 3D mesh at
-            // its original transform. `PlacedUnit`/`Stats`/its drag observer were never
-            // removed during the drag, so only the visual/transform components need resetting.
+            // its original transform. `PlacedUnit`/`Stats`/`Health`/`CombatRanges`/its drag
+            // observers were never removed during the drag, only its visual/transform
+            // components and its behavior state (stripped at pickup, see `on_unit_drag_start`)
+            // -- so it resumes marching from its restored spot, same as any other reposition.
             commands
                 .entity(moving)
                 .remove::<(Node, BackgroundColor, BorderColor)>()
@@ -1167,6 +1528,7 @@ fn cancel_drag_on_right_click(
                     session.original_transform,
                     Visibility::Visible,
                     Pickable::default(),
+                    Advancing,
                 ));
         }
         DragOrigin::Placed2D => {
