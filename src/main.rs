@@ -69,11 +69,19 @@
 //! `CombatRanges` change frame to frame, and these three components are mutually exclusive --
 //! changing behavior means swapping which one is attached, per the spec's request for
 //! state-via-components rather than one global `State` enum.
+//!
+//! Debug overlay & per-unit variance: every live 3D unit draws its detection/attack
+//! `CombatRanges` as flat gizmo circles on the ground, plus a small floating health bar above
+//! it, via `draw_unit_gizmos`. Each unit also gets a small random jitter applied to its
+//! `Stats` the moment it's first ever placed (see `random_stats`), so two units of the same
+//! shape aren't perfectly identical -- that jittered `Stats` then sticks with the entity for
+//! its whole life (repositioning or converting it never re-rolls it).
 
 use bevy::{
     camera::Viewport,
     color::palettes::tailwind::*,
     color::Alpha,
+    math::Isometry3d,
     picking::pointer::{PointerButton, PointerInteraction},
     prelude::*,
 };
@@ -88,6 +96,7 @@ fn main() {
             (
                 sync_world_camera_viewport,
                 draw_mesh_intersections,
+                draw_unit_gizmos,
                 update_coords_display,
                 cancel_drag_on_right_click,
             ),
@@ -104,9 +113,18 @@ fn main() {
 /// Size (in logical pixels) of a palette icon / a 2D ghost.
 const ICON_SIZE: f32 = 56.0;
 /// Size (world units) of the cube (Square/Fighter) shape.
-const CUBE_SIZE: f32 = 1.4;
+const CUBE_SIZE: f32 = 1.0;
 /// Radius (world units) of the sphere (Circle/Tank) shape.
-const SPHERE_RADIUS: f32 = 0.8;
+const SPHERE_RADIUS: f32 = 0.55;
+/// Uniform scale baked into the pyramid (Triangle/Assassin) mesh at creation time (see
+/// `setup_scene`), so it sits at roughly the same visual footprint as the (now-smaller)
+/// sphere/cube shapes above.
+const TRIANGLE_SCALE: f32 = 0.55;
+/// Approximate resting height / collision footprint (world units) of the scaled-down pyramid
+/// shape -- see the doc comments on `resting_height`/`collision_radius` for why these are
+/// hand-picked approximations rather than derived from the mesh.
+const TRIANGLE_RESTING_HEIGHT: f32 = 0.35;
+const TRIANGLE_COLLISION_RADIUS: f32 = 0.35;
 /// Width fraction of each side UI panel. The middle (3D) zone gets `1.0 - 2 * SIDE_FRACTION`.
 /// Kept in sync by hand with the `percent(20)` / `percent(60)` literals used in `setup_ui`.
 const SIDE_FRACTION: f32 = 0.2;
@@ -120,8 +138,9 @@ const PLACEMENT_HALF_SIZE: f32 = 0.8;
 /// has crossed the whole map and despawns.
 const MAP_HALF_SIZE: f32 = 15.0;
 /// World units per second of movement, per point of `Stats.speed`. `Stats.speed` is one of
-/// 10/20/30 (see `Stats::for_shape`), so this yields roughly 1.5 to 4.5 units/sec.
-const UNITS_PER_SPEED_POINT: f32 = 0.15;
+/// 10/20/30 (see `Stats::for_shape`, before per-unit jitter), so this yields roughly 0.9 to 2.7
+/// units/sec -- deliberately slower than before so units are easier to watch march/fight.
+const UNITS_PER_SPEED_POINT: f32 = 0.09;
 /// The `Stats.speed` value (the "++" mid-tier) treated as the 1.0x baseline for attack timing.
 const REFERENCE_SPEED: f32 = 20.0;
 /// Baseline attack wind-up duration (seconds) at `REFERENCE_SPEED`. Scaled by speed in
@@ -137,6 +156,15 @@ const SPAWN_SEARCH_RING_STEP: f32 = 0.5;
 const SPAWN_SEARCH_MAX_RINGS: i32 = 8;
 /// How many directions per ring `resolve_spawn_position` samples.
 const SPAWN_SEARCH_ANGLE_STEPS: i32 = 8;
+/// Lower/upper bound of the random per-unit stat jitter applied once, at spawn time (see
+/// `random_stats`): each of a unit's stats is independently multiplied by a factor in this
+/// range, so no two units of the same shape are perfectly identical.
+const STAT_JITTER_MIN: f32 = 0.85;
+const STAT_JITTER_MAX: f32 = 1.15;
+/// Width (world units) of a unit's floating health bar (see `draw_unit_gizmos`).
+const HEALTH_BAR_WIDTH: f32 = 1.0;
+/// Height (world units) above a unit's origin at which its health bar is drawn.
+const HEALTH_BAR_HEIGHT_OFFSET: f32 = 1.1;
 
 // --- Marker / data components -------------------------------------------------------------
 
@@ -187,7 +215,10 @@ struct Ghost;
 #[derive(Component)]
 struct OriginMarker;
 
-/// Placeholder combat stats. Not read by anything yet -- wired up for a future combat pass.
+/// A unit's stats. `hp` is also this unit's *maximum* hit points -- `Health` (below) tracks its
+/// current, possibly-lower value while it's alive. Each spawned unit gets its own small random
+/// jitter applied to these (see `random_stats`), so this is genuinely per-entity, not just a
+/// per-shape constant.
 #[derive(Component, Clone, Copy)]
 struct Stats {
     hp: u32,
@@ -198,6 +229,7 @@ struct Stats {
 impl Stats {
     fn for_shape(shape: ShapeKind) -> Self {
         // A simple +/++/+++ -> 10/20/30 scale, matching the relative ordering from the spec.
+        // This is the *baseline* before `random_stats` jitters it for an actual spawned unit.
         match shape {
             ShapeKind::Circle => Stats { hp: 30, attack: 20, speed: 10 }, // Tank
             ShapeKind::Square => Stats { hp: 20, attack: 10, speed: 30 }, // Fighter
@@ -206,9 +238,57 @@ impl Stats {
     }
 }
 
-/// Current HP of a live battlefield unit. Attached (at full `Stats.hp`) whenever an entity
-/// enters its 3D `PlacedUnit` form, and removed when it leaves the battlefield (converted back
-/// to a 2D unit) -- a unit that's redeployed later starts fresh, not wherever it left off.
+/// A tiny, dependency-free xorshift64* PRNG, seeded once at startup. Used only to jitter each
+/// newly spawned unit's stats (see `random_stats`) -- nothing here needs to be cryptographically
+/// sound, just varied run to run.
+#[derive(Resource)]
+struct RngState(u64);
+
+impl RngState {
+    /// Seeds from the current time so different runs of the app get different jitter; falls
+    /// back to a fixed non-zero seed if the clock is somehow unavailable. The `| 1` guarantees
+    /// a non-zero, odd seed, which xorshift requires to never get stuck at zero.
+    fn seeded() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x9E3779B97F4A7C15);
+        Self(seed | 1)
+    }
+
+    /// Next pseudo-random value in `[0.0, 1.0)`.
+    fn next_unit_f32(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        // Top 24 bits give us plenty of precision for a f32 in [0, 1).
+        ((self.0 >> 40) & 0x00FF_FFFF) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Next pseudo-random value in `[min, max)`.
+    fn next_range(&mut self, min: f32, max: f32) -> f32 {
+        min + self.next_unit_f32() * (max - min)
+    }
+}
+
+/// Applies a small independent random jitter (`STAT_JITTER_MIN`..`STAT_JITTER_MAX`) to each of
+/// `shape`'s baseline `Stats`, so no two spawned units of the same shape are perfectly
+/// identical. Called exactly once, the moment a unit is first ever placed (see
+/// `on_active_drag_end`'s `is_first_placement` branches) -- repositioning or converting an
+/// already-placed unit reuses its existing (already-jittered) `Stats` instead of rolling new
+/// ones.
+fn random_stats(shape: ShapeKind, rng: &mut RngState) -> Stats {
+    let base = Stats::for_shape(shape);
+    let jitter = |value: u32, rng: &mut RngState| -> u32 { (value as f32 * rng.next_range(STAT_JITTER_MIN, STAT_JITTER_MAX)).round().max(1.0) as u32 };
+    Stats {
+        hp: jitter(base.hp, rng),
+        attack: jitter(base.attack, rng),
+        speed: jitter(base.speed, rng),
+    }
+}
+
+/// Current HP of a live battlefield unit. Attached (at that unit's own jittered `Stats.hp`)
+/// whenever an entity enters its 3D `PlacedUnit` form, and removed when it leaves the
+/// battlefield (converted back to a 2D unit) -- a unit that's redeployed later starts fresh, not
+/// wherever it left off.
 #[derive(Component)]
 struct Health(f32);
 
@@ -314,8 +394,9 @@ fn resting_height(shape: ShapeKind) -> f32 {
         ShapeKind::Circle => SPHERE_RADIUS,
         ShapeKind::Square => CUBE_SIZE / 2.0,
         // Bevy's default `Tetrahedron` doesn't expose a simple size to compute this from
-        // exactly; this is a reasonable approximation -- nudge it if it looks off.
-        ShapeKind::Triangle => 0.6,
+        // exactly; this is a reasonable approximation for the `TRIANGLE_SCALE`-scaled mesh --
+        // nudge it if it looks off.
+        ShapeKind::Triangle => TRIANGLE_RESTING_HEIGHT,
     }
 }
 
@@ -327,7 +408,7 @@ fn collision_radius(shape: ShapeKind) -> f32 {
     match shape {
         ShapeKind::Circle => SPHERE_RADIUS,
         ShapeKind::Square => CUBE_SIZE / 2.0,
-        ShapeKind::Triangle => 0.6,
+        ShapeKind::Triangle => TRIANGLE_COLLISION_RADIUS,
     }
 }
 
@@ -749,6 +830,40 @@ fn tick_attacks(mut commands: Commands, mut attackers: Query<(&Stats, &mut Attac
     }
 }
 
+/// Debug overlay for every live 3D `PlacedUnit`: its detection/attack `CombatRanges` drawn as
+/// flat circles on the ground (translucent yellow / red), plus a small floating health bar
+/// (a dark background sliver with a green -> yellow -> red fill sized to its current HP
+/// fraction) hovering just above it.
+fn draw_unit_gizmos(units: Query<(&Transform, &Health, &Stats, &CombatRanges), With<PlacedUnit>>, mut gizmos: Gizmos) {
+    // A rotation that lays a gizmo circle flat on the XZ ground plane instead of the default
+    // vertical XY orientation.
+    let ground_facing = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+
+    for (transform, health, stats, ranges) in &units {
+        let pos = transform.translation;
+
+        gizmos.circle(Isometry3d::new(Vec3::new(pos.x, 0.02, pos.z), ground_facing), ranges.detection, Color::from(YELLOW_300).with_alpha(0.35));
+        gizmos.circle(Isometry3d::new(Vec3::new(pos.x, 0.03, pos.z), ground_facing), ranges.attack, Color::from(RED_400).with_alpha(0.55));
+
+        let bar_y = pos.y + HEALTH_BAR_HEIGHT_OFFSET;
+        let half_width = HEALTH_BAR_WIDTH / 2.0;
+        let left = Vec3::new(pos.x - half_width, bar_y, pos.z);
+        let right = Vec3::new(pos.x + half_width, bar_y, pos.z);
+        gizmos.line(left, right, Color::BLACK.with_alpha(0.6));
+
+        let fraction = (health.0 / stats.hp as f32).clamp(0.0, 1.0);
+        let fill_color = if fraction > 0.5 {
+            Color::from(GREEN_500)
+        } else if fraction > 0.25 {
+            Color::from(YELLOW_400)
+        } else {
+            Color::from(RED_500)
+        };
+        let fill_right = Vec3::new(left.x + HEALTH_BAR_WIDTH * fraction, bar_y + 0.015, pos.z);
+        gizmos.line(left + Vec3::Y * 0.015, fill_right, fill_color);
+    }
+}
+
 // --- Scene setup (3D world) ---------------------------------------------------------------
 
 fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
@@ -781,10 +896,15 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut mat
         Transform::from_xyz(0.0, 7., 14.0).looking_at(Vec3::new(0., 1., 0.), Vec3::Y),
     ));
 
-    // Shared meshes/materials for all placed units and ghosts.
+    // Shared meshes/materials for all placed units and ghosts. The pyramid mesh has
+    // `TRIANGLE_SCALE` baked directly into its vertices here (rather than applied as a
+    // per-entity `Transform` scale later) so every spot that builds a unit's `Transform` from a
+    // plain translation keeps working unchanged.
     let sphere_mesh = meshes.add(Sphere::new(SPHERE_RADIUS).mesh().ico(5).unwrap());
     let cube_mesh = meshes.add(Cuboid::new(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE));
-    let pyramid_mesh = meshes.add(Tetrahedron::default());
+    // `scaled_by` lives on the finished `Mesh`, not on the shape's mesh *builder*, so convert
+    // first and scale after.
+    let pyramid_mesh = meshes.add(Mesh::from(Tetrahedron::default()).scaled_by(Vec3::splat(TRIANGLE_SCALE)));
 
     let blue_solid = materials.add(Color::from(BLUE_500));
     let mut blue_ghost_mat: StandardMaterial = Color::from(BLUE_300).with_alpha(GHOST_ALPHA).into();
@@ -807,6 +927,7 @@ fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut mat
     });
     commands.insert_resource(DragSession::default());
     commands.insert_resource(UnitSnapshot::default());
+    commands.insert_resource(RngState::seeded());
 }
 
 /// Keeps the world camera's viewport locked to exactly the middle 60% of the window, in
@@ -1234,7 +1355,7 @@ fn on_active_drag(
     let desired_is_2d = zone_of(pos.x, width) != Zone::World;
 
     let is_currently_2d = {
-        let mut p0 = queries.p0();
+        let p0 = queries.p0();
         let Ok((node_opt, _, _)) = p0.get(moving) else {
             return;
         };
@@ -1358,6 +1479,10 @@ fn restore_placed2d(commands: &mut Commands, assets: &SharedAssets, shape: Shape
 ///   unit sitting exactly where it was dropped, stripping any combat/movement state -- this is
 ///   what "3D -> 2D, converting it back" actually leaves behind, and what makes 2D -> 2D
 ///   dragging (same panel, or across to the other one) work.
+///
+/// Stats: a brand-new unit (`is_first_placement`) rolls its own randomly jittered `Stats` (see
+/// `random_stats`) exactly once, here; anything already placed keeps whatever `Stats` it already
+/// has, fetched via `existing_stats` -- repositioning or converting a unit never re-rolls it.
 fn on_active_drag_end(
     trigger: On<Pointer<DragEnd>>,
     mut commands: Commands,
@@ -1365,11 +1490,13 @@ fn on_active_drag_end(
     // decide whether this is its first-ever placement (attach permanent data/observers) or a
     // reposition/conversion of something that already existed (don't re-attach).
     already_placed: Query<(Has<PlacedUnit>, Has<Placed2DUnit>)>,
+    existing_stats: Query<&Stats>,
     placed_units: Query<(&Transform, &PlacedUnit)>,
     windows: Query<&Window>,
     world_camera: Single<(&Camera, &GlobalTransform), With<WorldCamera>>,
     assets: Res<SharedAssets>,
     mut session: ResMut<DragSession>,
+    mut rng: ResMut<RngState>,
 ) {
     if trigger.button != PointerButton::Primary {
         return;
@@ -1410,6 +1537,11 @@ fn on_active_drag_end(
 
         let (has_3d, has_2d) = already_placed.get(moving).unwrap_or((false, false));
         let is_first_placement = !has_3d && !has_2d;
+        let stats = if is_first_placement {
+            random_stats(session.shape, &mut rng)
+        } else {
+            existing_stats.get(moving).copied().unwrap_or_else(|_| Stats::for_shape(session.shape))
+        };
 
         let mut unit = commands.entity(moving);
         unit.remove::<(Node, BackgroundColor, BorderColor, Ghost, Placed2DUnit, Seeking, Attacking)>().insert((
@@ -1427,18 +1559,19 @@ fn on_active_drag_end(
             unit.insert(Advancing);
         } else {
             // Entering (or re-entering, from a 2D placement) the battlefield: always full
-            // strength, starting out marching.
-            unit.insert((Health(Stats::for_shape(session.shape).hp as f32), combat_ranges(session.shape), Advancing));
+            // strength (relative to its own -- possibly jittered -- max hp), starting out
+            // marching.
+            unit.insert((Health(stats.hp as f32), combat_ranges(session.shape), Advancing));
         }
 
         if is_first_placement {
-            // First time this entity becomes a real unit: attach its permanent data, plus the
-            // observers it'll need for every future drag of its own. Both DragStart observers
-            // (2D and 3D) are attached unconditionally -- each only acts when its own marker
-            // component is present, so whichever form isn't currently active just makes that
-            // one a harmless no-op instead of needing to track "which observers are already
-            // attached" separately.
-            unit.insert((PlacedUnit { team: session.team, shape: session.shape }, Stats::for_shape(session.shape)))
+            // First time this entity becomes a real unit: attach its permanent data (including
+            // its freshly rolled `stats`), plus the observers it'll need for every future drag
+            // of its own. Both DragStart observers (2D and 3D) are attached unconditionally --
+            // each only acts when its own marker component is present, so whichever form isn't
+            // currently active just makes that one a harmless no-op instead of needing to track
+            // "which observers are already attached" separately.
+            unit.insert((PlacedUnit { team: session.team, shape: session.shape }, stats))
                 .observe(on_unit_drag_start)
                 .observe(on_placed2d_drag_start)
                 .observe(on_active_drag)
@@ -1478,7 +1611,8 @@ fn on_active_drag_end(
             ));
 
         if is_first_placement {
-            unit.insert((Placed2DUnit { team: session.team, shape: session.shape }, Stats::for_shape(session.shape)))
+            let stats = random_stats(session.shape, &mut rng);
+            unit.insert((Placed2DUnit { team: session.team, shape: session.shape }, stats))
                 .observe(on_unit_drag_start)
                 .observe(on_placed2d_drag_start)
                 .observe(on_active_drag)
